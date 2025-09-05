@@ -1,0 +1,596 @@
+---
+title: "AI4PH: Federated Learning Tutorial"
+format: 
+  html:
+    self-contained: true
+---
+
+## Setup
+
+We begin by loading the necessary packages and functions and setting a seed for reproducibility.
+
+```{r}
+# Load packages
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(skimr)
+  library(nnet)
+})
+
+# Load functions
+source("fl_funs.R")
+
+# Set seed (for reproducibility)
+set.seed(123)
+```
+
+## Load and process data
+
+Next, we load the simulated cardiovascular disease (CVD) dataset, adding an explicit `site` column to identify the source of each observation. The dataset contains information on patients from three different sites: an urban academic medical center, a suburban practice, and a rural community clinic.
+
+```{r}
+# Load training data
+df_train_urban <- read_csv("sim/urban_train.csv", show_col_types = FALSE) %>%
+  mutate(site = "Urban Academic")
+df_train_suburban <- read_csv("sim/suburban_train.csv", show_col_types = FALSE) %>%
+  mutate(site = "Suburban Practice")
+df_train_rural <- read_csv("sim/rural_train.csv", show_col_types = FALSE) %>%
+  mutate(site = "Rural Community")
+
+# Load testing data
+df_test_urban <- read_csv("sim/urban_test.csv", show_col_types = FALSE) %>%
+  mutate(site = "Urban Academic")
+df_test_suburban <- read_csv("sim/suburban_test.csv", show_col_types = FALSE) %>%
+  mutate(site = "Suburban Practice")
+df_test_rural <- read_csv("sim/rural_test.csv", show_col_types = FALSE) %>%
+  mutate(site = "Rural Community")
+```
+
+The first thing we will do is examine the training datasets from our various sites (for simplicity, we will assume the testing datasets are formatted identically).
+
+```{r}
+skim(df_train_urban)
+skim(df_train_suburban)
+skim(df_train_rural)
+```
+
+For most variable, we see nothing particularly concerning: a handful of missing values and no obviously wrong values (e.g., an age of 150). A systolic BP of 181 probably counts as a hypertensive crisis, though.
+
+The variables `sex` and `gender` are a problem though, as the former is present only in the Rural dataset and the latter only in the Urban and Suburban datasets.
+
+We can write a function to check the unique values of all categorical variables across all the training datasets.
+
+```{r}
+for (var in c("sex", "gender", "smoking_status")) {
+  cat("\nVariable:", var, "\n")
+  urban_vals <- sort(unique(df_train_urban[[var]]))
+  suburban_vals <- sort(unique(df_train_suburban[[var]]))
+  rural_vals <- sort(unique(df_train_rural[[var]]))
+  cat("  Urban: ", paste(urban_vals, collapse = ", "), "\n")
+  cat("  Suburban: ", paste(suburban_vals, collapse = ", "), "\n")
+  cat("  Rural: ", paste(rural_vals, collapse = ", "), "\n")
+}
+```
+
+It looks like the `sex` variable can be renamed and recoded to match the other sites. The `smoking_status` variable is already consistent across sites.
+
+```{r}
+# Rename and recode sex variable at Rural site as gender
+recode_gender <- function(df) {
+  df %>%
+    mutate(
+      gender = case_when(
+        sex == "M" ~ "Male",
+        sex == "F" ~ "Female",
+        is.na(sex) ~ NA_character_
+      )
+    ) %>%
+    select(-sex) # drop sex column
+}
+df_train_rural <- recode_gender(df_train_rural)
+df_test_rural  <- recode_gender(df_test_rural)
+```
+
+Next, we will deal with bad or missing data. This can be done through a variety of methods, such as imputation, truncation, or exclusion. Remember that in a real-world scenario, steps such as imputation would generally be done on a per-site basis, unless there was explicit coordination on this front between sites (e.g., through a federated process or a simpler form of data exchange).
+
+If we wanted to impute missing data, we could simply use the median (continuous) or modal (categorical) for each variable within each site, or we could use more complicates methods of imputation such as multivariate imputation as implemented in the `mice` package.
+
+For simplicity, in this tutorial we will simply remove the small percentage of rows with missing data (complete case analysis).
+
+```{r}
+df_train_urban <- df_train_urban[complete.cases(df_train_urban), ]
+df_train_suburban <- df_train_suburban[complete.cases(df_train_suburban), ]
+df_train_rural <- df_train_rural[complete.cases(df_train_rural), ]
+df_test_urban <- df_test_urban[complete.cases(df_test_urban), ]
+df_test_suburban <- df_test_suburban[complete.cases(df_test_suburban), ]
+df_test_rural <- df_test_rural[complete.cases(df_test_rural), ]
+```
+
+We will now combine the training datasets into a single data frame, `df_train`, and the testing datasets into `df_test`. This is where we will convert our categorical variables from `character` to `factor` to ensure there is no conflict (e.g., between the order of the levels). The purpose of this is twofold: first, these datasets will be used directly in the pooled analysis, and second, they will be used in modified form for the federated learning analysis.  **This is for convenience only and to reduce potential issues with the federated learning function. The federated learning function splits the datasets back into site-specific datasets internally to simulate a true federated setup.** Conceptually, for the federated learning analysis, we can think of this step as coordination between the sites on an agreed-upon schema for the data between sites (e.g., agreeing that "Female" is the reference category for the `gender` variable).
+
+```{r}
+df_train <- bind_rows(df_train_urban, df_train_suburban, df_train_rural)
+head(df_train)
+df_test <- bind_rows(df_test_urban, df_test_suburban, df_test_rural)
+head(df_test)
+```
+
+The first thing we will do is convert our categorical variables from `character` to `factor` so they are handled correctly by our summary function and by the modelling functions we will use later. **It is especially important that we also convert the outcome variable, `cvd`, to a factor with levels `c(0, 1)`**, as this ensures that the modelling functions will work properly for a binary classification task.
+
+```{r}
+# Convert categorical variables to factors
+# Recall that the first "level" will be used as the reference category in our models
+convert_factors <- function(df) {
+  df$gender <- factor(df$gender, levels = c("Female", "Male"))
+  df$smoking_status <- factor(df$smoking_status, levels = c("Never", "Former", "Current"))
+  df$cvd <- factor(df$cvd, levels = c(0, 1))
+  df$site <- factor(df$site) # doesn't matter as we will not be using site as a covariate
+  return(df)
+}
+df_train <- convert_factors(df_train)
+df_test  <- convert_factors(df_test)
+```
+
+Earlier, we observed that the data distributions differ across sites, i.e., the data are not IID across sites. We could verify this statistically if we'd like (e.g., using Kruskal-Wallis test for continuous variables or Chi-squared test for categorical variables).
+
+```{r}
+# Example: Kruskal-Wallis test for continuous variable `age` across sites
+kruskal.test(age ~ site, data = df_train)
+
+# Example: Chi-squared test for categorical variable `smoking_status` across sites
+chisq.test(df_train$smoking_status, df_train$site)
+```
+
+Before we split the data, let's do a little feature engineering. Suppose we believe BMI has a non-linear effect and want to categorize it for our logistic regression model (but letting our tree-based models handle it naturally). We can create a new variable `bmi_cat` that categorizes BMI into low, medium, and high.
+
+For the federated analysis, this step would be part of defining the schema for the data that all sites agree to use.
+
+```{r}
+# Add BMI categories
+add_bmi_cat <- function(df) {
+  df <- df %>%
+    mutate(
+      bmi_cat = case_when(
+        bmi < 18.5 ~ "Low",
+        bmi >= 18.5 & bmi < 25 ~ "Medium",
+        TRUE ~ "High"
+      ),
+      # Use "Medium" as reference category
+      bmi_cat = factor(bmi_cat, levels = c("Medium", "Low", "High"))
+    )
+  return(df)
+}
+df_train <- add_bmi_cat(df_train)
+df_test  <- add_bmi_cat(df_test)
+```
+
+We are now ready to do some model fitting.
+
+## Federated learning
+
+### Logistic regression with FedAvg
+
+```{r}
+fl_lr <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "FedAvg",
+  model = "logistic",
+  formula = cvd ~ age + gender + bmi_cat + systolic_bp + exercise_hrs_per_week + smoking_status
+)
+```
+
+We can examine the initial per-site models in the object returned by the `fed_learn()` function.
+
+```{r}
+# Examine initial per-site models
+fl_lr$models_initial
+
+# See per-site model accuracies
+fl_lr$accuracy_initial
+```
+
+We can also examine the coefficients of the FedAvg process, which are used for the updated model:
+
+```{r}
+fl_lr$models_updated[[1]]$coefficients
+```
+
+Now we can can extract the predictions (probabilities and discrete classes) from the federated learning object (these are in the same order as the `df_test` data frame). We can use these to calculate some evaluation metrics for our logistic regression model on the pooled dataset, including the accuracy, sensitivity, specificity, and area under the ROC curve (AUC).
+
+```{r}
+# Extract predictions
+df_test$pred_lr_fl <- fl_lr$probabilities_overall_updated
+df_test$pred_class_lr_fl <- fl_lr$predictions_overall_updated
+
+# Calculate accuracy, sensitivity/specificity, AUC
+acc_lr_fl <- accuracy(
+  df_test,
+  pred_class_lr_fl, # discrete class predictions
+  truth = cvd
+)
+acc_lr_fl
+sensitivity(
+  df_test,
+  pred_class_lr_fl, # discrete class predictions
+  truth = cvd,
+  event_level = "second" # use 1 as event
+)
+specificity(
+  df_test,
+  pred_class_lr_fl,
+  truth = cvd,
+  event_level = "second" # use 1 as event
+)
+roc_curve(
+  df_test,
+  pred_lr_fl, # probabilities
+  truth = cvd,
+  event_level = "second" # use 1 as event
+) %>% autoplot()
+roc_auc(
+  df_test,
+  pred_lr_fl, # probabilities
+  truth = cvd,
+  event_level = "second" # use 1 as event
+)
+```
+
+See the `yardstick` package for more information on calculating evaluation metrics.
+
+We can also write a custom function to calculate the accuracy with a 95% binomial confidence interval using the `binom.test()` function, in the absence of other methods of calculating confidence intervals for accuracy (e.g., cross-validation or bootstrapping).
+
+```{r}
+# Function: Calculate accuracy with 95% binomial CI
+accuracy_ci <- function(data, pred_class, truth) {
+  bt <- binom.test(
+  sum(data[[pred_class]] == data[[truth]]),
+  nrow(data),
+  conf.level = 0.95 # using Clopper-Pearson method
+  )
+  tibble(
+  .estimate = bt$estimate,
+  lower = bt$conf.int[1],
+  upper = bt$conf.int[2]
+  )
+}
+
+# Recalculate accuracy with confidence interval
+acc_lr_fl <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_lr_fl",
+  truth = "cvd"
+)
+acc_lr_fl
+```
+
+### Random forest with Distributed Ensemble
+
+```{r}
+# Pass optional parameters to randomForest() function as additional arguments
+# See ?randomForest for details on available parameters
+fl_rf <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "Distributed Ensemble",
+  model = "randomForest",
+  formula = cvd ~ age + gender + bmi + systolic_bp + exercise_hrs_per_week + smoking_status,
+  ntree = 500, # pass optional parameter
+  mtry = 2 # pass optional parameter
+)
+
+# Extract predictions
+df_test$pred_rf_fl <- fl_rf$probabilities_overall_updated
+df_test$pred_class_rf_fl <- fl_rf$predictions_overall_updated
+
+# Calculate accuracy
+acc_rf_fl <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_rf_fl", # column name as string
+  truth = "cvd" # column name as string
+)
+acc_rf_fl
+```
+
+### XGBoost with Distributed Ensemble
+
+```{r}
+# Pass optional parameters to xgboost() function as additional arguments
+# See ?xgboost for details on available parameters
+# The argument `nrounds` is required for xgboost() but defaults to 100 if not specified here.
+# Note: The xgboost function requires the data to be in a specific format,
+# but the fed_learn() function will handle the conversion for you.
+fl_xgb <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "Distributed Ensemble",
+  model = "xgboost",
+  formula = cvd ~ age + gender + bmi + systolic_bp + exercise_hrs_per_week + smoking_status,
+  nrounds = 100 # required argument for xgboost() but defaults to 100 if missing here
+)
+
+# Extract predictions
+df_test$pred_xgb_fl <- fl_xgb$probabilities_overall_updated
+df_test$pred_class_xgb_fl <- fl_xgb$predictions_overall_updated
+
+# Calculate accuracy
+acc_xgb_fl <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_xgb_fl",
+  truth = "cvd"
+)
+acc_xgb_fl
+```
+
+## Comparison to pooled datasets
+
+Next, we can proceed to fitting models on the pooled datasets. Here, we use the base fitting functions.
+
+### Logistic regression
+
+```{r}
+# Fit a logistic regression model on the pooled dataset
+mod_lr <- glm(
+  cvd ~ age + gender + bmi_cat + systolic_bp + exercise_hrs_per_week + smoking_status,
+  data = df_train,
+  family = "binomial")
+
+# Predict on the test set
+df_test$pred_lr_pool <- predict(mod_lr, newdata = df_test, type = "response") # probabilities
+df_test$pred_class_lr_pool <- factor(ifelse(df_test$pred_lr_pool >= 0.5, 1, 0), levels = c(0, 1)) # discrete class predictions
+
+# Calculate accuracy
+acc_lr_pool <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_lr_pool",
+  truth = "cvd"
+)
+acc_lr_pool
+```
+
+### Random forest
+
+```{r}
+# Fit a random forest model on the pooled dataset
+mod_rf <- randomForest(
+  cvd ~ age + gender + bmi + systolic_bp + exercise_hrs_per_week + smoking_status,
+  data = df_train,
+  ntree = 500, # optional parameter
+  mtry = 2) # optional parameter
+df_test$pred_rf_pool <- predict(mod_rf, newdata = df_test, type = "prob")[, 2]
+df_test$pred_class_rf_pool <- factor(ifelse(df_test$pred_rf_pool >= 0.5, 1, 0), levels = c(0, 1))
+
+# Calculate accuracy
+acc_rf_pool <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_rf_pool",
+  truth = "cvd"
+)
+acc_rf_pool
+```
+
+The data for XGBoost requires special preparation. This was handled for us automatically in the federated learning function.
+
+### XGBoost
+
+```{r}
+# Prepare data for XGBoost
+xgb_terms <- terms(cvd ~ age + gender + bmi + systolic_bp + exercise_hrs_per_week + smoking_status)
+df_train_xgb <- model.matrix(xgb_terms, data = df_train)[, -1, drop = FALSE] # drop intercept
+df_test_xgb <- model.matrix(xgb_terms, data = df_test)[, -1, drop = FALSE] # drop intercept
+df_train_label <- as.numeric(as.character(df_train$cvd)) # convert factor to numeric (0, 1)
+df_test_label <- as.numeric(as.character(df_test$cvd)) # convert factor to numeric (0, 1)
+
+# Fit an XGBoost model on the pooled dataset
+mod_xgb <- xgboost(
+  data = df_train_xgb,
+  label = df_train_label,
+  objective = "binary:logistic", # required
+  nrounds = 100, # required
+  verbose = 0 # suppress output
+)
+df_test$pred_xgb_pool <- predict(mod_xgb, newdata = df_test_xgb)
+df_test$pred_class_xgb_pool <- factor(ifelse(df_test$pred_xgb_pool >= 0.5, 1, 0), levels = c(0, 1))
+
+# Calculate accuracy
+acc_xgb_pool <- accuracy_ci(
+  df_test,
+  pred_class = "pred_class_xgb_pool",
+  truth = "cvd"
+)
+acc_xgb_pool
+```
+
+### Neural network
+
+We can also fit a simple neural network model on the pooled dataset using the `nnet` package. This is not supported by the federated learning function, but we can still compare the pooled analysis to the other models.
+
+```{r}
+# Fit a neural network model on the pooled dataset
+mod_nn <- nnet(
+  cvd ~ age + gender + bmi + systolic_bp + exercise_hrs_per_week + smoking_status,
+  data = df_train,
+  size = 5, # important parameter
+  maxit = 200,
+  trace = FALSE # suppress output
+)
+df_test$pred_nn_pool <- predict(mod_nn, newdata = df_test, type = "raw")
+df_test$pred_class_nn_pool <- factor(ifelse(df_test$pred_nn_pool >= 0.5, 1, 0), levels = c(0, 1))
+
+# Calculate accuracy
+acc_nn_pool <- accuracy_ci(df_test, pred_class = "pred_class_nn_pool", truth = "cvd")
+acc_nn_pool
+```
+
+Below is a final comparison of the test accuracy between the federated learning models and the pooled dataset models.
+
+```{r}
+# Calculate initial accuracies with CIs for federated learning models
+df_test$pred_class_lr_fl_initial <- fl_lr$predictions_overall_initial
+acc_lr_fl_initial <- accuracy_ci(df_test, pred_class = "pred_class_lr_fl_initial", truth = "cvd")
+df_test$pred_class_rf_fl_initial <- fl_rf$predictions_overall_initial
+acc_rf_fl_initial <- accuracy_ci(df_test, pred_class = "pred_class_rf_fl_initial", truth = "cvd")
+df_test$pred_class_xgb_fl_initial <- fl_xgb$predictions_overall_initial
+acc_xgb_fl_initial <- accuracy_ci(df_test, pred_class = "pred_class_xgb_fl_initial", truth = "cvd")
+
+# Combine accuracies into a data frame for comparison
+accuracy_comparison <- data.frame(
+  Model = rep(c(
+    "Logistic regression", "Random forest", "XGBoost"
+  ), times = 3),
+  Strategy = rep(c("Site-specific", "Federated", "Pooled"), each = 3),
+  Accuracy = c(
+    acc_lr_fl_initial$.estimate,
+    acc_rf_fl_initial$.estimate,
+    acc_xgb_fl_initial$.estimate,
+    acc_lr_fl$.estimate,
+    acc_rf_fl$.estimate,
+    acc_xgb_fl$.estimate,
+    acc_lr_pool$.estimate,
+    acc_rf_pool$.estimate,
+    acc_xgb_pool$.estimate
+  ),
+  lower = c(
+    acc_lr_fl_initial$lower,
+    acc_rf_fl_initial$lower,
+    acc_xgb_fl_initial$lower,
+    acc_lr_fl$lower,
+    acc_rf_fl$lower,
+    acc_xgb_fl$lower,
+    acc_lr_pool$lower,
+    acc_rf_pool$lower,
+    acc_xgb_pool$lower
+  ),
+  upper = c(
+    acc_lr_fl_initial$upper,
+    acc_rf_fl_initial$upper,
+    acc_xgb_fl_initial$upper,
+    acc_lr_fl$upper,
+    acc_rf_fl$upper,
+    acc_xgb_fl$upper,
+    acc_lr_pool$upper,
+    acc_rf_pool$upper,
+    acc_xgb_pool$upper
+  )
+)
+
+# Add pooled neural network model
+accuracy_comparison <- rbind(
+  accuracy_comparison,
+  data.frame(
+    Model = "Neural network",
+    Strategy = "Pooled",
+    Accuracy = acc_nn_pool$.estimate,
+    lower = acc_nn_pool$lower,
+    upper = acc_nn_pool$upper
+  )
+)
+
+# Define factor levels for plotting
+accuracy_comparison$Model <- factor(accuracy_comparison$Model, levels = rev(
+  c(
+    "Logistic regression",
+    "Random forest",
+    "XGBoost",
+    "Neural network"
+  )
+))
+accuracy_comparison$Strategy <- factor(accuracy_comparison$Strategy,
+                                       levels = c("Site-specific", "Federated", "Pooled"))
+
+# Plot
+ggplot(accuracy_comparison,
+       aes(x = Accuracy, y = Model, colour = Strategy)) +
+  geom_point(size = 4, alpha = 0.7) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  scale_colour_manual(values = c(
+    "Site-specific" = "#1f77b4",
+    "Federated" = "#2ca02c",
+    "Pooled" = "#d62728"
+  )) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Accuracy", y = NULL, colour = "Strategy") +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.y = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1)))
+```
+
+## Additional evaluation
+
+We can do any number of other analyses, such as looking at fairness metrics. We can look at either subgroup fairness (i.e., fairness across different demographic groups within the dataset) or participation fairness (i.e., fairness across different clients/sites). For illustration, let's calculate some metrics on the FedAvg logistic regression model.
+
+```{r}
+# Fairness between subgroups: accuracy by gender
+df_test %>%
+  group_by(gender) %>%
+  accuracy(pred_class_lr_fl, truth = cvd)
+```
+
+```{r}
+# Fairness between clients (sites)
+
+# Jain's fairness index (1 = perfect fairness) on site-specific accuracies
+site_acc <- df_test %>%
+  group_by(site) %>%
+  accuracy(truth = cvd, estimate = pred_class_lr_fl) %>%
+  pull(.estimate)
+n_sites <- length(site_acc)
+jain_index <- (sum(site_acc)^2) / (n_sites * sum(site_acc^2))
+site_acc
+jain_index
+
+# Predicted positive rate: (TP + FP) / Total sample size (by site)
+ppr_site <- df_test %>%
+  group_by(site) %>%
+  summarize(PPR = mean(pred_class_lr_fl == 1))
+ppr_site
+
+# False discovery rate: FP / (TP + FP) (by site)
+fdr_site <- df_test %>%
+  group_by(site) %>%
+  summarize(FDR = sum(pred_class_lr_fl == 1 &
+                        cvd == 0) / sum(pred_class_lr_fl == 1))
+fdr_site
+
+# Prevalence by site: % of positive cases (by site)
+prev_site <- df_test %>%
+  group_by(site) %>%
+  summarize(Prevalence = mean(cvd == 1))
+prev_site
+```
+
+Something else we can do is compare parameter estimates between strategies, say for the term for "Male" in the logistic regression model:
+
+```{r}
+gender_est <- tibble(
+  Model = c(fl_lr$site_names, "Federated", "Pooled", "True value"),
+  Estimate = c(
+    sapply(fl_lr$models_initial, \(x) x$coefficients["genderMale"]), # sites
+    fl_lr$models_updated[[1]]$coefficients["genderMale"], # federated
+    mod_lr$coefficients["genderMale"], # pooled model
+    0.4 # true value from simulation
+  )
+)
+gender_est$Model <- factor(
+  gender_est$Model, levels = c(fl_lr$site_names, "Federated", "Pooled", "True value"))
+ggplot(gender_est, aes(x = Estimate, y = Model)) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 0.4, linetype = "dashed", color = "red") +
+  labs(
+    x = "Estimate",
+    y = "Model"
+  ) +
+  theme_minimal()
+```

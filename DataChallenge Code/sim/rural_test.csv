@@ -1,0 +1,21 @@
+age,bmi,systolic_bp,exercise_hrs_per_week,smoking_status,cvd,site,sex
+49,31,144,0,Former,1,Rural Community,F
+64,22,114,1,Former,1,Rural Community,M
+50,36,132,0,Current,1,Rural Community,F
+60,26,126,2,Former,0,Rural Community,F
+27,26,80,1,Former,0,Rural Community,F
+61,31,108,2,Former,0,Rural Community,F
+85,15,83,1,Never,1,Rural Community,F
+76,38,132,1,Current,1,Rural Community,F
+77,35,95,3,Current,1,Rural Community,F
+50,21,130,2,Current,1,Rural Community,M
+70,26,148,NA,Never,1,Rural Community,F
+68,20,85,0,Never,0,Rural Community,M
+52,33,152,1,Current,1,Rural Community,M
+55,29,106,7,Current,0,Rural Community,F
+62,27,122,2,Current,1,Rural Community,M
+63,29,94,2,Former,0,Rural Community,F
+85,15,133,1,Former,1,Rural Community,M
+60,24,124,0,Former,1,Rural Community,M
+79,29,125,1,Never,1,Rural Community,F
+55,29,122,2,Never,0,Rural Community,M

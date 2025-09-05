@@ -1,0 +1,231 @@
+---
+title: "AI4PH: Federated Learning Reference"
+format: 
+  html:
+    self-contained: true
+execute:
+  eval: false
+---
+
+```{r}
+#| echo: false
+#| message: false
+library(readr)
+library(dplyr)
+library(yardstick)
+library(randomForest)
+library(xgboost)
+source("fl_funs.R")
+set.seed(123)
+df <- read_csv("sim/cvd_sim.csv") # data missing, for illustration only
+df <- df[complete.cases(df), ] # remove rows with missing values]
+# Split data into train/test
+# Set aside 20% of each site for testing
+df$row_id <- seq_len(nrow(df)) # add unique ID
+df_train <- df %>%
+  group_by(site) %>%
+  slice_sample(prop = 0.8) %>%
+  ungroup()
+df_test <- anti_join(df, df_train, by = "row_id")
+```
+
+## Preparing data
+
+### Data preparation
+
+The requirements your input data frames are:
+
+- You have two identical data frames: one for training and one for testing, each containing the same sites and variables (e.g., `df_train` and `df_test`).
+- The data frames contain a binary target variable encoded as a factor with two levels (`c(0, 1)`).
+- The data frames contain a column that identifies the site (named `site` by default).
+- All categorical variables in the data frame must be encoded as factors, which allows choosing the reference level of the variable (i.e., the first level) and ensuring this reference level is consistent across sites. You must also ensure that all levels of a categorical variable are present in the training data for each site. The exception to this is the site identifier variable, which should never be used as a covariate in the federated learning models. Unused variables should be dropped from `df_train` and `df_test` before fitting the model.
+- Ensure that none of your sites contain variables with zero variance (i.e., all the same values across all rows for that site). This will cause a variable to be dropped during model fitting, which can lead to errors in the federated learning process.
+
+```{r}
+# Encode the outcome variable as a factor
+df_train$cvd <- factor(df_train$cvd, levels = c(0, 1))
+df_test$cvd <- factor(df_test$cvd, levels = c(0, 1))
+# Keep only columns of interest
+df_train <- df_train[, c("site", "cvd", "age", "gender")]
+df_test <- df_test[, c("site", "cvd", "age", "gender")]
+# Encode categorical variable as factor
+df_train$gender <- factor(df_train$gender, levels = c("Female", "Male"))
+df_test$gender <- factor(df_test$gender, levels = c("Female", "Male"))
+```
+
+### Logistic regression, Random forest
+
+For logistic regression and random forest, the base modelling functions (`glm` and `randomForest`) can be used directly with with your training and testing data frames. Below, we show the code for fitting a model on the complete training data and predicting probabilities on the test data. Finally, we use `accuracy` and `roc_auc` from the `yardstick` package to calculate accuracy and AUC of the predictions.
+
+```{r}
+# Logistic regression
+mod_lr <- glm(cvd ~ age + gender, data = df_train, family = "binomial")
+df_test$pred_lr <- predict(mod_lr, newdata = df_test, type = "response") # probabilities
+df_test$pred_class_lr <- factor(ifelse(df_test$pred_lr >= 0.5, 1, 0), levels = c(0, 1)) # discrete class predictions
+accuracy(
+  df_test,
+  pred_class_lr, # discrete class predictions
+  truth = cvd
+)
+roc_auc(
+  df_test,
+  pred_lr, # probabilities
+  truth = cvd,
+  event_level = "second" # use 1 as event
+)
+
+# Random forest
+mod_rf <- randomForest(
+  cvd ~ age + gender, data = df_train,
+  ntree = 500, # optional parameter
+  mtry = 2) # optional parameter
+df_test$pred_rf <- predict(mod_rf, newdata = df_test, type = "prob")[, 2]
+df_test$pred_class_rf <- factor(ifelse(df_test$pred_rf >= 0.5, 1, 0), levels = c(0, 1))
+accuracy(
+  df_test,
+  pred_class_rf,
+  truth = cvd
+)
+roc_auc(
+  df_test,
+  pred_rf,
+  truth = cvd,
+  event_level = "second"
+)
+```
+
+The model objects can also have a variety of function-specific functions and methods applied to them as well, such as `varImportPlot` for `randomForest` models.
+
+```{r}
+varImpPlot(mod_rf)
+```
+
+### XGBoost
+
+For XGBoost, the data must be formatted as a matrix of numeric predictors (factors must be converted to dummies) and a vector of labels (i.e., the target variable for classification). Luckily, this can be easily done with a standard formula and the `model.matrix` function.
+
+```{r}
+# Prepare data for XGBoost
+xgb_terms <- terms(cvd ~ age + gender)
+df_train_xgb <- model.matrix(xgb_terms, data = df_train)[, -1, drop = FALSE] # drop intercept
+df_test_xgb <- model.matrix(xgb_terms, data = df_test)[, -1, drop = FALSE] # drop intercept
+df_train_label <- as.numeric(as.character(df_train$cvd)) # convert factor to numeric (0, 1)
+df_test_label <- as.numeric(as.character(df_test$cvd)) # convert factor to numeric (0, 1)
+
+# XGBoost
+mod_xgb <- xgboost(
+  data = df_train_xgb,
+  label = df_train_label,
+  objective = "binary:logistic", # required
+  nrounds = 100, # required
+  verbose = 0 # suppress output
+)
+df_test$pred_xgb <- predict(mod_xgb, newdata = df_test_xgb)
+df_test$pred_class_xgb <- factor(ifelse(df_test$pred_xgb >= 0.5, 1, 0), levels = c(0, 1))
+accuracy(
+  df_test,
+  pred_class_xgb,
+  truth = cvd
+)
+roc_auc(
+  df_test,
+  pred_xgb,
+  truth = cvd,
+  event_level = "second"
+)
+```
+
+The model objects can also have a variety of function-specific functions and methods applied to them as well, such as `xgb.importance` for `xgboost` models.
+
+```{r}
+xgb.importance(model = mod_xgb)
+```
+
+## Federated learning
+
+All federated learning methods use the same interface, `fed_learn`.
+
+### Logistic regression: FedAvg
+
+For FedAvg with logistic regression, specify the `algorithm` as `"FedAvg"` and the `model` as `"logistic"`. The `target_col` and `site_col` arguments are used to specify the target variable and site identifier, respectively. The `formula` argument is used to specify the model formula.
+
+```{r}
+fl_lr <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "FedAvg",
+  model = "logistic",
+  formula = cvd ~ age + gender
+)
+```
+
+### Distributed ensemble: Random forest
+
+For Distributed Ensemble with random forest, specify the `algorithm` as `"Distributed Ensemble"` and the `model` as `"randomForest"`. The `target_col` and `site_col` arguments are used to specify the target variable and site identifier, respectively. The `formula` argument is used to specify the model formula. Optional parameters may also passed to the `randomForest` function as additional arguments.
+
+```{r}
+# Pass optional parameters to randomForest() function as additional arguments
+# See ?randomForest for details on available parameters
+fl_rf <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "Distributed Ensemble",
+  model = "randomForest",
+  formula = cvd ~ age + gender,
+  ntree = 500, # pass optional parameter
+  mtry = 2 # pass optional parameter
+)
+```
+
+### Distributed ensemble: XGBoost
+
+For Distributed Ensemble with XGBoost, specify the `algorithm` as `"Distributed Ensemble"` and the `model` as `"xgboost"`. The `target_col` and `site_col` arguments are used to specify the target variable and site identifier, respectively. Unlike the previous example where we used the `xgboost` function directly, we use the same data format as for the other models. Conversion to the `xgboost` model format is handled automatically by the `formula` argument, similar to how we previously used the formula combined with the function `model.matrix` to construct the required data format with the raw `xgboost` function. The required `nrounds` parameter and other optional parameters may also passed to the `xgboost` function as additional arguments.
+
+```{r}
+# Pass optional parameters to xgboost() function as additional arguments
+# See ?xgboost for details on available parameters
+# The argument `nrounds` is required for xgboost() but defaults to 100 if not specified here.
+# Note: This function requires the data to be in a specific format,
+# but the fed_learn() function will handle the conversion for you.
+fl_xgb <- fed_learn(
+  df_train,
+  df_test,
+  target_col = "cvd",
+  site_col = "site",
+  algorithm = "Distributed Ensemble",
+  model = "xgboost",
+  formula = cvd ~ age + gender,
+  nrounds = 100, # required argument for xgboost() but defaults to 100 if missing here
+  verbose = 0 # defaults to 0 unless specified otherwise here
+)
+```
+
+### Function output
+
+- `algorithm`: Either "FedAvg" or "Distributed Ensemble"
+- `model`: Either "logistic", "randomForest", or "xgboost"
+- `site_names`: A vector of site names
+- `site_weights`: A vector of site weights (based on training data sample size)
+- `models_initial`: A list of initial models for each site
+- `models_updated`: A list of updated models for each site (only applicaple for FedAvg; all updated coefficients are identical)
+- `accuracy_initial`: A named vector of initial accuracies for each site
+- `accuracy_updated`: A named vector of updated accuracies for each site
+- `accuracy_overall_initial`: Overall accuracy for initial models
+- `accuracy_overall_updated`: Overall accuracy for updated models
+- `truth_overall`: The truth values for the overall test set (i.e., the target variable)
+- `predictions_initial`: A named list of initial predictions for each site
+- `predictions_updated`: A named list of updated predictions for each site
+- `probabilities_initial`: A named list of initial probabilities for each site
+- `probabilities_updated`: A named list of updated probabilities for each site
+- `predictions_overall_initial`: Overall predictions for initial models (in the same order as `df_test`)
+- `predictions_overall_updated`: Overall predictions for updated models (in the same order as `df_test`)
+- `probabilities_overall_initial`: Overall probabilities for initial models (in the same order as `df_test`)
+- `probabilities_overall_updated`: Overall probabilities for updated models (in the same order as `df_test`)
+
+Note that the models returned in `models_updated` as part of FedAvg are not generally usable for the usual functions for `glm` objects such as `summary` or even `predict(se.fit = TRUE)`, **since only the coefficients have been updated and nothing else** (e.g., standard error estimates for coefficients, etc.). They are also not usable for common model selection functions such as `AIC`. However, model selection may still be performed using other means (e.g., splitting off a validation set from the training data).
+
+Model objects returned in `models_initial` are suitable for use in the usual functions for `glm`, `randomForest`, and `xgboost` objects.
